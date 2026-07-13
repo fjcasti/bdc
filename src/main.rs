@@ -115,9 +115,10 @@ fn mostrar_ayuda(db_path: &PathBuf) {
     println!();
     println!("  Uso: BDC [opcion] [texto]");
     println!();
-    println!("  /?         Muestra esta ayuda");
-    println!("  /a [XXX]   Añadir el texto XXX al fichero de datos");
-    println!("  /b XXX     Busca el texto XXX en el fichero de datos");
+    println!("  /?           Muestra esta ayuda");
+    println!("  /a [XXX]     Añadir el texto XXX al fichero de datos");
+    println!("  /b XXX       Busca el texto XXX en el fichero de datos");
+    println!("  /bd FICHERO  Usa FICHERO como base de datos");
     println!();
     println!("  Fichero de datos: {}", db_path.display());
 }
@@ -315,16 +316,24 @@ fn resolver_ruta_db(bc_fichero: Option<&str>) -> PathBuf {
         eprintln!("Se buscará la configuración en bdc.ini.");
     }
 
-    if let Some(ruta_ini) = leer_ruta_ini() {
-        if es_fichero_valido(&ruta_ini) {
-            return ruta_ini;
+    let ini_path = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.join("bdc.ini")));
+    let ini_existe = ini_path.as_deref().map(|p| p.exists()).unwrap_or(false);
+
+    match leer_ruta_ini() {
+        Some(ruta_ini) if es_fichero_valido(&ruta_ini) => return ruta_ini,
+        Some(ruta_ini) => {
+            if !ruta_ini.exists() {
+                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini no existe.", ruta_ini.display());
+            } else {
+                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini está vacío.", ruta_ini.display());
+            }
+            eprintln!("bdc.ini no resultó válido. Se usará el fichero por defecto.");
         }
-        if !ruta_ini.exists() {
-            eprintln!("Aviso: el fichero '{}' (ruta del INI) no existe.", ruta_ini.display());
-        } else {
-            eprintln!("Aviso: el fichero '{}' (ruta del INI) está vacío.", ruta_ini.display());
+        None if ini_existe => {
+            eprintln!("Aviso: bdc.ini no contiene una ruta válida. Se usará el fichero por defecto.");
         }
-        eprintln!("Se usará el fichero por defecto.");
+        None => {}
     }
 
     defecto()
@@ -334,7 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_args: Vec<String> = std::env::args().skip(1).collect();
 
     let (db_path, args): (PathBuf, Vec<String>) =
-        if all_args.first().map(|s| s.as_str()) == Some("/bc") {
+        if all_args.first().map(|s| s.as_str()) == Some("/bd") {
             let fichero = all_args.get(1).map(|s| s.as_str());
             let db = resolver_ruta_db(fichero);
             let resto = all_args.into_iter().skip(2).collect();
