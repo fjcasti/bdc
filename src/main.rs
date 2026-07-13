@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use termimad::MadSkin;
 use unicode_normalization::UnicodeNormalization;
 
-const VERSION: &str = "1.2";
-const DB_PATH: &str = r"C:\Users\dars\Desktop\Casti\datos\bdc.db";
+const VERSION: &str = "1.3";
 
 fn normalizar(s: &str) -> String {
     s.nfd()
@@ -133,10 +132,10 @@ fn mostrar_ayuda(db_path: &PathBuf) {
     println!();
     println!("  Uso: BDC [opcion] [texto]");
     println!();
-    println!("  /?         Muestra esta ayuda");
-    println!("  /a [XXX]   Añadir el texto XXX al fichero de datos");
-    println!("  /b XXX     Busca palabras (OR). Entre comillas busca frase exacta");
-    println!("  /BD FILE   Usa FILE como fichero de datos (por defecto: {})", DB_PATH);
+    println!("  /?           Muestra esta ayuda");
+    println!("  /a [XXX]     Añadir el texto XXX al fichero de datos");
+    println!("  /b XXX       Busca el texto XXX en el fichero de datos");
+    println!("  /bd FICHERO  Usa FICHERO como base de datos");
     println!();
     println!("  Fichero de datos: {}", db_path.display());
 }
@@ -281,59 +280,100 @@ fn modo_anadir(conn: &Connection, inicial: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn leer_ini(exe_dir: &std::path::Path) -> Option<PathBuf> {
+fn leer_ruta_ini() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let contenido = std::fs::read_to_string(exe_dir.join("bdc.ini")).ok()?;
+
+    let mut en_seccion = false;
     for linea in contenido.lines() {
         let linea = linea.trim();
-        if linea.to_lowercase().starts_with("bbdd=") {
-            let valor = linea[5..].trim();
-            if !valor.is_empty() {
-                return Some(PathBuf::from(valor));
+        if linea.is_empty() || linea.starts_with(';') {
+            continue;
+        }
+        if linea.starts_with('[') {
+            en_seccion = linea.eq_ignore_ascii_case("[base_de_datos]");
+            continue;
+        }
+        if en_seccion {
+            if let Some(pos) = linea.find('=') {
+                if linea[..pos].trim().eq_ignore_ascii_case("ruta") {
+                    let valor = linea[pos + 1..].trim();
+                    if !valor.is_empty() {
+                        return Some(PathBuf::from(valor));
+                    }
+                }
             }
         }
     }
     None
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+fn es_fichero_valido(path: &PathBuf) -> bool {
+    path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
 
-    // Extraer /BD si está presente
-    let (bd_cli, args) = if let Some(pos) = raw_args.iter().position(|a| a.eq_ignore_ascii_case("/BD")) {
-        match raw_args.get(pos + 1) {
-            Some(path) => {
-                let path = PathBuf::from(path);
-                let remaining = raw_args.iter().enumerate()
-                    .filter(|(i, _)| *i != pos && *i != pos + 1)
-                    .map(|(_, s)| s.clone())
-                    .collect();
-                (Some(path), remaining)
-            }
-            None => {
-                eprintln!("Uso: /BD <ruta_fichero>");
-                return Ok(());
-            }
+fn resolver_ruta_db(bc_fichero: Option<&str>) -> PathBuf {
+    let defecto = || -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("bdc.db")))
+            .unwrap_or_else(|| PathBuf::from("bdc.db"))
+    };
+
+    if let Some(ruta) = bc_fichero {
+        let path = PathBuf::from(ruta);
+        if es_fichero_valido(&path) {
+            return path;
         }
-    } else {
-        (None, raw_args)
-    };
+        if !path.exists() {
+            eprintln!("Aviso: el fichero '{}' no existe.", path.display());
+        } else {
+            eprintln!("Aviso: el fichero '{}' está vacío.", path.display());
+        }
+        eprintln!("Se buscará la configuración en bdc.ini.");
+    }
 
-    // Prioridad: /BD > bdc.ini > DB_PATH
-    let db_path = if let Some(path) = bd_cli {
-        path
-    } else {
-        let exe_dir = std::env::current_exe()?
-            .parent()
-            .expect("ejecutable sin directorio padre")
-            .to_path_buf();
-        leer_ini(&exe_dir).unwrap_or_else(|| PathBuf::from(DB_PATH))
-    };
+    let ini_path = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.join("bdc.ini")));
+    let ini_existe = ini_path.as_deref().map(|p| p.exists()).unwrap_or(false);
+
+    match leer_ruta_ini() {
+        Some(ruta_ini) if es_fichero_valido(&ruta_ini) => return ruta_ini,
+        Some(ruta_ini) => {
+            if !ruta_ini.exists() {
+                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini no existe.", ruta_ini.display());
+            } else {
+                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini está vacío.", ruta_ini.display());
+            }
+            eprintln!("bdc.ini no resultó válido. Se usará el fichero por defecto.");
+        }
+        None if ini_existe => {
+            eprintln!("Aviso: bdc.ini no contiene una ruta válida. Se usará el fichero por defecto.");
+        }
+        None => {}
+    }
+
+    defecto()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let all_args: Vec<String> = std::env::args().skip(1).collect();
+
+    let (db_path, args): (PathBuf, Vec<String>) =
+        if all_args.first().map(|s| s.as_str()) == Some("/bd") {
+            let fichero = all_args.get(1).map(|s| s.as_str());
+            let db = resolver_ruta_db(fichero);
+            let resto = all_args.into_iter().skip(2).collect();
+            (db, resto)
+        } else {
+            (resolver_ruta_db(None), all_args)
+        };
 
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
 
     match args.as_slice() {
-        [] | [_] if args.first().map(|s| s.as_str()) == Some("/?") => {
+        [s] if s == "/?" => {
             mostrar_ayuda(&db_path);
         }
         [] => {
