@@ -60,22 +60,39 @@ fn guardar(conn: &Connection, texto: &str, tags: &[String]) -> SqlResult<()> {
     Ok(())
 }
 
+fn parsear_terminos(termino: &str) -> Vec<String> {
+    let trimmed = termino.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+        vec![normalizar(&trimmed[1..trimmed.len() - 1])]
+    } else {
+        trimmed.split_whitespace().map(|w| normalizar(w)).collect()
+    }
+}
+
 fn buscar(conn: &Connection, termino: &str) -> SqlResult<()> {
     let skin = MadSkin::default();
-    let patron = format!("%{}%", normalizar(termino));
+    let terminos = parsear_terminos(termino);
+    let patrones: Vec<String> = terminos.iter().map(|t| format!("%{}%", t)).collect();
 
-    let mut stmt = conn.prepare("
-        SELECT DISTINCT t.id, t.contenido, t.creado_en
-        FROM textos t
-        LEFT JOIN texto_etiquetas te ON te.texto_id = t.id
-        LEFT JOIN etiquetas e ON e.id = te.etiqueta_id
-        WHERE t.contenido LIKE ?1
-           OR e.nombre    LIKE ?1
-        ORDER BY t.id DESC
-    ")?;
+    let condiciones: Vec<String> = (1..=patrones.len())
+        .map(|i| format!("(t.contenido LIKE ?{i} OR e.nombre LIKE ?{i})"))
+        .collect();
+    let sql = format!(
+        "SELECT DISTINCT t.id, t.contenido, t.creado_en
+         FROM textos t
+         LEFT JOIN texto_etiquetas te ON te.texto_id = t.id
+         LEFT JOIN etiquetas e ON e.id = te.etiqueta_id
+         WHERE {}
+         ORDER BY t.id DESC",
+        condiciones.join(" OR ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
 
     let filas: Vec<(i64, String, String)> = stmt
-        .query_map([&patron], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .query_map(rusqlite::params_from_iter(patrones.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
