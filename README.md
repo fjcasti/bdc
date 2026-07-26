@@ -1,4 +1,4 @@
-# BDC 1.2 - Base de Conocimiento
+# BDC 1.4 - Base de Conocimiento
 
 Aplicación de consola para Windows que permite almacenar y recuperar textos con etiquetas, usando SQLite como base de datos embebida.
 
