@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use termimad::MadSkin;
 use unicode_normalization::UnicodeNormalization;
 
-const VERSION: &str = "1.3";
+const VERSION: &str = "1.4";
 
 fn normalizar(s: &str) -> String {
     s.nfd()
@@ -77,31 +77,49 @@ fn buscar(conn: &Connection, termino: &str) -> SqlResult<()> {
     let condiciones: Vec<String> = (1..=patrones.len())
         .map(|i| format!("(t.contenido LIKE ?{i} OR e.nombre LIKE ?{i})"))
         .collect();
-    let sql = format!(
-        "SELECT DISTINCT t.id, t.contenido, t.creado_en
+
+    let sql_base = "SELECT DISTINCT t.id, t.contenido, t.creado_en
          FROM textos t
          LEFT JOIN texto_etiquetas te ON te.texto_id = t.id
          LEFT JOIN etiquetas e ON e.id = te.etiqueta_id
          WHERE {}
-         ORDER BY t.id DESC",
-        condiciones.join(" OR ")
-    );
+         ORDER BY t.id DESC";
 
-    let mut stmt = conn.prepare(&sql)?;
+    let ejecutar_query = |sql: &str| -> SqlResult<Vec<(i64, String, String)>> {
+        let mut stmt = conn.prepare(sql)?;
+        let filas = stmt
+            .query_map(rusqlite::params_from_iter(patrones.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(filas)
+    };
 
-    let filas: Vec<(i64, String, String)> = stmt
-        .query_map(rusqlite::params_from_iter(patrones.iter()), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let sql_and = sql_base.replace("{}", &condiciones.join(" AND "));
+    let mut filas = ejecutar_query(&sql_and)?;
+    let mut modo_fallback = false;
+
+    if filas.is_empty() && patrones.len() > 1 {
+        let sql_or = sql_base.replace("{}", &condiciones.join(" OR "));
+        filas = ejecutar_query(&sql_or)?;
+        modo_fallback = true;
+    }
 
     if filas.is_empty() {
         println!("Sin resultados para \"{}\".", termino);
         return Ok(());
     }
 
-    println!("{} resultado(s) para \"{}\":", filas.len(), termino);
+    if modo_fallback {
+        println!(
+            "{} resultado(s) parciales para \"{}\" (coincidencia con algún término):",
+            filas.len(),
+            termino
+        );
+    } else {
+        println!("{} resultado(s) para \"{}\":", filas.len(), termino);
+    }
 
     for (id, contenido, creado_en) in &filas {
         let mut tag_stmt = conn.prepare("
