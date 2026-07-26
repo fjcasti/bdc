@@ -46,7 +46,7 @@ El editor se abre con ese texto pre-cargado para continuar escribiendo.
 
 ### Buscar
 
-Varias palabras — se devuelven entradas que contengan cualquiera de ellas (OR):
+Varias palabras — se devuelven entradas que contengan todas ellas (AND), en caso de no encontrar ninguna coincidencias se busca por cualquiera de ellas (OR):
 
 ```
 bdc /b rust sqlite
