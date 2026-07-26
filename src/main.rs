@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use termimad::MadSkin;
 use unicode_normalization::UnicodeNormalization;
 
-const VERSION: &str = "1.3";
+const VERSION: &str = "1.4";
 
 fn normalizar(s: &str) -> String {
     s.nfd()
