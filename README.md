@@ -58,6 +58,15 @@ Frase exacta — se encierra entre comillas:
 bdc /b "base de datos"
 ```
 
+Si se proporciona texto pero no parámetros se considera el parámetro **/b**. Es decir por defecto busca.
+Estos dos comandos son equivalentes
+
+```
+bdc /b rust sqlite
+bdc rust sqlite
+```
+
+
 La búsqueda es insensible a mayúsculas y acentos. Se busca tanto en el contenido del texto como en las etiquetas.
 
 ### Configurar la base de datos
