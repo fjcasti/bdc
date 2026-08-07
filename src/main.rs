@@ -405,8 +405,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buscar(&conn, &termino)?;
             }
         }
-        _ => {
-            eprintln!("Opción no reconocida. Use /? para ver la ayuda.");
+        otros => {
+            let termino = otros.join(" ");
+            buscar(&conn, &termino)?;
         }
     }
 
