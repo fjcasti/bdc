@@ -1,6 +1,8 @@
 use arboard::Clipboard; 
 use crossterm::{
+    cursor::{MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use rusqlite::{Connection, Result as SqlResult};
@@ -9,13 +11,26 @@ use std::path::PathBuf;
 use termimad::MadSkin;
 use unicode_normalization::UnicodeNormalization;
 
-const VERSION: &str = "1.5";
+const VERSION: &str = "1.6";
 
 fn normalizar(s: &str) -> String {
     s.nfd()
         .filter(|c| !('\u{0300}'..='\u{036F}').contains(c))
         .collect::<String>()
         .to_lowercase()
+}
+
+/// En modo raw el terminal no traduce '\n' a CR+LF: hay que emitir el
+/// retorno de carro explícitamente para volver a la primera columna.
+fn nueva_linea(stdout: &mut io::Stdout) -> io::Result<()> {
+    print!("\r\n");
+    stdout.flush()
+}
+
+/// Escribe texto en modo raw expandiendo cada salto de línea a CR+LF.
+fn escribir_raw(stdout: &mut io::Stdout, texto: &str) -> io::Result<()> {
+    print!("{}", texto.replace("\r\n", "\n").replace('\n', "\r\n"));
+    stdout.flush()
 }
 
 fn init_db(conn: &Connection) -> SqlResult<()> {
@@ -156,9 +171,9 @@ fn mostrar_ayuda(db_path: &PathBuf) {
 
 fn pedir_etiquetas() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    println!("{}", "-".repeat(60));
-    println!("Introduce etiquetas. Enter = añadir etiqueta. Enter vacío = terminar.");
-    println!("{}", "-".repeat(60));
+    print!("{}\r\n", "-".repeat(60));
+    print!("Introduce etiquetas. Enter = añadir etiqueta. Enter vacío = terminar.\r\n");
+    print!("{}\r\n", "-".repeat(60));
     stdout.flush()?;
 
     let mut tags: Vec<String> = Vec::new();
@@ -188,20 +203,19 @@ fn read_line(stdout: &mut io::Stdout) -> Result<Option<String>, Box<dyn std::err
                 (KeyModifiers::NONE, KeyCode::Esc) => return Ok(None),
 
                 (KeyModifiers::NONE, KeyCode::Enter) => {
-                    println!();
+                    nueva_linea(stdout)?;
                     return Ok(Some(buf));
                 }
 
                 (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-                    disable_raw_mode()?;
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if let Ok(content) = clipboard.get_text() {
+                            let content = content.replace(['\r', '\n'], " ");
                             print!("{}", content);
                             stdout.flush()?;
                             buf.push_str(&content);
                         }
                     }
-                    enable_raw_mode()?;
                 }
 
                 (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
@@ -229,14 +243,13 @@ fn modo_anadir(conn: &Connection, inicial: &str) -> Result<(), Box<dyn std::erro
     println!("Escribe texto. Enter = nueva línea. Ctrl+V = pegar. ESC = aceptar.");
     println!("{}", "-".repeat(60));
 
-    // Mostrar y pre-rellenar el texto inicial si lo hay
-    if !inicial.is_empty() {
-        print!("{}", inicial);
-    }
     stdout.flush()?;
 
     let mut text = inicial.to_string();
     enable_raw_mode()?;
+    if !inicial.is_empty() {
+        escribir_raw(&mut stdout, inicial)?;
+    }
 
     loop {
         if let Event::Key(key) = event::read()? {
@@ -247,15 +260,13 @@ fn modo_anadir(conn: &Connection, inicial: &str) -> Result<(), Box<dyn std::erro
                 (KeyModifiers::NONE, KeyCode::Esc) => break,
 
                 (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-                    disable_raw_mode()?;
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if let Ok(content) = clipboard.get_text() {
-                            print!("{}", content);
-                            stdout.flush()?;
+                            let content = content.replace("\r\n", "\n");
+                            escribir_raw(&mut stdout, &content)?;
                             text.push_str(&content);
                         }
                     }
-                    enable_raw_mode()?;
                 }
 
                 (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
@@ -265,14 +276,23 @@ fn modo_anadir(conn: &Connection, inicial: &str) -> Result<(), Box<dyn std::erro
                 }
 
                 (KeyModifiers::NONE, KeyCode::Enter) => {
-                    println!();
+                    nueva_linea(&mut stdout)?;
                     text.push('\n');
                 }
 
                 (KeyModifiers::NONE, KeyCode::Backspace) => {
-                    if text.pop().is_some() {
-                        print!("\x08 \x08");
-                        stdout.flush()?;
+                    match text.pop() {
+                        // Al borrar un salto de línea hay que subir y colocarse
+                        // al final de la línea anterior.
+                        Some('\n') => {
+                            let col = text.rsplit('\n').next().unwrap_or("").chars().count();
+                            execute!(stdout, MoveUp(1), MoveToColumn(col as u16))?;
+                        }
+                        Some(_) => {
+                            print!("\x08 \x08");
+                            stdout.flush()?;
+                        }
+                        None => {}
                     }
                 }
 
