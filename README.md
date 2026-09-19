@@ -15,16 +15,18 @@ Aplicación de consola para Windows que permite almacenar y recuperar textos con
 ```
 BDC [opcion] [texto]
 
-  /?         Muestra esta ayuda
-  /a [XXX]   Añadir el texto XXX al fichero de datos
-  /b XXX     Busca palabras (OR). Entre comillas busca frase exacta
-  /BD FILE   Usa FILE como fichero de datos
+  -?, -h     Muestra esta ayuda
+  -a [XXX]   Añadir el texto XXX al fichero de datos
+  -b XXX     Busca palabras (OR). Entre comillas busca frase exacta
+  -bd FILE   Usa FILE como fichero de datos
 ```
+
+También se acepta la notación clásica de Windows (`/?`, `/a`, `/b`, `/bd`).
 
 ### Añadir una entrada
 
 ```
-bdc /a
+bdc -a
 ```
 
 Se abre el editor interactivo:
@@ -39,7 +41,7 @@ A continuación se solicitan etiquetas (una por línea). **Enter vacío** termin
 También se puede pasar texto directamente como argumento:
 
 ```
-bdc /a esto es una nota rápida
+bdc -a esto es una nota rápida
 ```
 
 El editor se abre con ese texto pre-cargado para continuar escribiendo.
@@ -49,20 +51,20 @@ El editor se abre con ese texto pre-cargado para continuar escribiendo.
 Varias palabras — se devuelven entradas que contengan todas ellas (AND), en caso de no encontrar ninguna coincidencias se busca por cualquiera de ellas (OR):
 
 ```
-bdc /b rust sqlite
+bdc -b rust sqlite
 ```
 
 Frase exacta — se encierra entre comillas:
 
 ```
-bdc /b "base de datos"
+bdc -b "base de datos"
 ```
 
-Si se proporciona texto pero no parámetros se considera el parámetro **/b**. Es decir por defecto busca.
+Si se proporciona texto pero no parámetros se considera el parámetro **-b**. Es decir por defecto busca.
 Estos dos comandos son equivalentes
 
 ```
-bdc /b rust sqlite
+bdc -b rust sqlite
 bdc rust sqlite
 ```
 
@@ -73,9 +75,9 @@ La búsqueda es insensible a mayúsculas y acentos. Se busca tanto en el conteni
 
 La ruta de la base de datos se resuelve en este orden de prioridad:
 
-1. **Parámetro `/BD`** en línea de comandos:
+1. **Parámetro `-bd`** en línea de comandos:
    ```
-   bdc /BD C:\ruta\mi_bd.db /b texto
+   bdc -bd C:\ruta\mi_bd.db -b texto
    ```
 
 2. **Fichero `bdc.ini`** en la misma carpeta que el ejecutable, con la sección y la clave:

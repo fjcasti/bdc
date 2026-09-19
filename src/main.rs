@@ -161,10 +161,12 @@ fn mostrar_ayuda(db_path: &PathBuf) {
     println!();
     println!("  Uso: BDC [opcion] [texto]");
     println!();
-    println!("  /?           Muestra esta ayuda");
-    println!("  /a [XXX]     Añadir el texto XXX al fichero de datos");
-    println!("  /b XXX       Busca el texto XXX en el fichero de datos");
-    println!("  /bd FICHERO  Usa FICHERO como base de datos");
+    println!("  -?, -h        Muestra esta ayuda");
+    println!("  -a [XXX]      Añadir el texto XXX al fichero de datos");
+    println!("  -b XXX        Busca el texto XXX en el fichero de datos");
+    println!("  -bd FICHERO   Usa FICHERO como base de datos");
+    println!();
+    println!("  También se acepta la notación clásica: /?, /a, /b, /bd");
     println!();
     println!("  Fichero de datos: {}", db_path.display());
 }
@@ -390,11 +392,23 @@ fn resolver_ruta_db(bc_fichero: Option<&str>) -> PathBuf {
     defecto()
 }
 
+/// Normaliza una opción de línea de comandos quitando el prefijo `/`, `--` o `-`
+/// y pasándola a minúsculas, para aceptar tanto la notación Windows (`/a`)
+/// como la Unix (`-a`, `--a`) indistintamente.
+fn normalizar_opcion(opcion: &str) -> String {
+    opcion
+        .strip_prefix("--")
+        .or_else(|| opcion.strip_prefix('/'))
+        .or_else(|| opcion.strip_prefix('-'))
+        .unwrap_or(opcion)
+        .to_lowercase()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_args: Vec<String> = std::env::args().skip(1).collect();
 
     let (db_path, args): (PathBuf, Vec<String>) =
-        if all_args.first().map(|s| s.as_str()) == Some("/bd") {
+        if all_args.first().map(|s| normalizar_opcion(s)).as_deref() == Some("bd") {
             let fichero = all_args.get(1).map(|s| s.as_str());
             let db = resolver_ruta_db(fichero);
             let resto = all_args.into_iter().skip(2).collect();
@@ -407,20 +421,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_db(&conn)?;
 
     match args.as_slice() {
-        [s] if s == "/?" => {
+        [s] if matches!(normalizar_opcion(s).as_str(), "?" | "h" | "help") => {
             mostrar_ayuda(&db_path);
         }
         [] => {
             mostrar_ayuda(&db_path);
         }
-        [opcion, resto @ ..] if opcion == "/a" => {
+        [opcion, resto @ ..] if normalizar_opcion(opcion) == "a" => {
             let texto = resto.join(" ");
             modo_anadir(&conn, &texto)?;
         }
-        [opcion, resto @ ..] if opcion == "/b" => {
+        [opcion, resto @ ..] if normalizar_opcion(opcion) == "b" => {
             let termino = resto.join(" ");
             if termino.is_empty() {
-                eprintln!("Uso: BDC /b <texto>");
+                eprintln!("Uso: BDC -b <texto>");
             } else {
                 buscar(&conn, &termino)?;
             }
