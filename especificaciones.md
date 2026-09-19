@@ -20,7 +20,7 @@ La base de datos se crea al lado del ejecutable.
 
 la linea de comandos de la aplicación se ajusta a esta ayuda:
 
-    BDC 1.0 - Base de Conocimiento
+    BDC x.y - Base de Conocimiento
 
       Uso: BDC [opcion] [texto]
 
@@ -29,6 +29,8 @@ la linea de comandos de la aplicación se ajusta a esta ayuda:
       /b XXX          Busca el texto XXX en el fichero de datos
     
     Fichero de datos: c:\Users\dars\Desktop\Casti\repos\bdc\target\debug\bdc.db 
+
+La linea de comandos acepta las opciones en format /a o en formato -a. Ambas notaciones 
 
 Al buscar se mostrarán las entradas encontradas completas
 
