@@ -1,449 +1,206 @@
-use arboard::Clipboard; 
-use crossterm::{
-    cursor::{MoveToColumn, MoveUp},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
-use rusqlite::{Connection, Result as SqlResult};
-use std::io::{self, Write};
-use std::path::PathBuf;
-use termimad::MadSkin;
-use unicode_normalization::UnicodeNormalization;
+//! BDC - Base de Conocimiento.
+//!
+//! Aplicación de consola para guardar y recuperar notas clasificadas con
+//! etiquetas en una base de datos SQLite. Las notas se escriben con un editor
+//! de texto externo y se muestran con formato Markdown.
 
-const VERSION: &str = "1.6";
+mod cli;
+mod config;
+mod db;
+mod editor;
+mod salida;
+mod texto;
 
-fn normalizar(s: &str) -> String {
-    s.nfd()
-        .filter(|c| !('\u{0300}'..='\u{036F}').contains(c))
-        .collect::<String>()
-        .to_lowercase()
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use cli::{Accion, Orden};
+use config::Config;
+use db::Bd;
+
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
+
+/// Motivo por el que termina la ejecución con error.
+enum Fallo {
+    /// Error de uso: se muestra el mensaje y la ayuda.
+    Uso(String),
+    /// Cualquier otro error: solo el mensaje.
+    Error(String),
 }
 
-/// En modo raw el terminal no traduce '\n' a CR+LF: hay que emitir el
-/// retorno de carro explícitamente para volver a la primera columna.
-fn nueva_linea(stdout: &mut io::Stdout) -> io::Result<()> {
-    print!("\r\n");
-    stdout.flush()
-}
-
-/// Escribe texto en modo raw expandiendo cada salto de línea a CR+LF.
-fn escribir_raw(stdout: &mut io::Stdout, texto: &str) -> io::Result<()> {
-    print!("{}", texto.replace("\r\n", "\n").replace('\n', "\r\n"));
-    stdout.flush()
-}
-
-fn init_db(conn: &Connection) -> SqlResult<()> {
-    conn.execute_batch("
-        CREATE TABLE IF NOT EXISTS textos (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            contenido  TEXT    NOT NULL,
-            creado_en  TEXT    NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS etiquetas (
-            id     INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT    NOT NULL UNIQUE
-        );
-
-        CREATE TABLE IF NOT EXISTS texto_etiquetas (
-            texto_id    INTEGER NOT NULL REFERENCES textos(id),
-            etiqueta_id INTEGER NOT NULL REFERENCES etiquetas(id),
-            PRIMARY KEY (texto_id, etiqueta_id)
-        );
-    ")
-}
-
-fn guardar(conn: &Connection, texto: &str, tags: &[String]) -> SqlResult<()> {
-    conn.execute("INSERT INTO textos (contenido) VALUES (?1)", [texto])?;
-    let texto_id = conn.last_insert_rowid();
-
-    for tag in tags {
-        let tag = normalizar(tag);
-        conn.execute("INSERT OR IGNORE INTO etiquetas (nombre) VALUES (?1)", [&tag])?;
-        let etiqueta_id: i64 = conn.query_row(
-            "SELECT id FROM etiquetas WHERE nombre = ?1",
-            [&tag],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-            "INSERT INTO texto_etiquetas (texto_id, etiqueta_id) VALUES (?1, ?2)",
-            [texto_id, etiqueta_id],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn parsear_terminos(termino: &str) -> Vec<String> {
-    let trimmed = termino.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
-        vec![normalizar(&trimmed[1..trimmed.len() - 1])]
-    } else {
-        trimmed.split_whitespace().map(|w| normalizar(w)).collect()
+impl From<rusqlite::Error> for Fallo {
+    fn from(e: rusqlite::Error) -> Self {
+        Fallo::Error(format!("error en la base de datos: {e}"))
     }
 }
 
-fn buscar(conn: &Connection, termino: &str) -> SqlResult<()> {
-    let skin = MadSkin::default();
-    let terminos = parsear_terminos(termino);
-    let patrones: Vec<String> = terminos.iter().map(|t| format!("%{}%", t)).collect();
+impl From<std::io::Error> for Fallo {
+    fn from(e: std::io::Error) -> Self {
+        Fallo::Error(format!("error de entrada/salida: {e}"))
+    }
+}
 
-    let condiciones: Vec<String> = (1..=patrones.len())
-        .map(|i| format!("(t.contenido LIKE ?{i} OR e.nombre LIKE ?{i})"))
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
         .collect();
-
-    let sql_base = "SELECT DISTINCT t.id, t.contenido, t.creado_en
-         FROM textos t
-         LEFT JOIN texto_etiquetas te ON te.texto_id = t.id
-         LEFT JOIN etiquetas e ON e.id = te.etiqueta_id
-         WHERE {}
-         ORDER BY t.id DESC";
-
-    let ejecutar_query = |sql: &str| -> SqlResult<Vec<(i64, String, String)>> {
-        let mut stmt = conn.prepare(sql)?;
-        let filas = stmt
-            .query_map(rusqlite::params_from_iter(patrones.iter()), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(filas)
-    };
-
-    let sql_and = format!("{}", sql_base.replace("{}", &condiciones.join(" AND ")));
-    let mut filas = ejecutar_query(&sql_and)?;
-    let mut modo_fallback = false;
-
-    if filas.is_empty() && patrones.len() > 1 {
-        let sql_or = format!("{}", sql_base.replace("{}", &condiciones.join(" OR ")));
-        filas = ejecutar_query(&sql_or)?;
-        modo_fallback = true;
+    let cfg = Config::cargar();
+    for aviso in &cfg.avisos {
+        eprintln!("Aviso: {aviso}");
     }
 
-    if filas.is_empty() {
-        println!("Sin resultados para \"{}\".", termino);
+    let resultado = cli::analizar(&args)
+        .map_err(|e| Fallo::Uso(e.to_string()))
+        .and_then(|orden| ejecutar(orden, &cfg));
+
+    match resultado {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Fallo::Uso(mensaje)) => {
+            eprintln!("Error: {mensaje}");
+            eprintln!();
+            salida::mostrar_ayuda(&cfg.resolver_bd().0);
+            ExitCode::FAILURE
+        }
+        Err(Fallo::Error(mensaje)) => {
+            eprintln!("Error: {mensaje}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ejecutar(orden: Orden, cfg: &Config) -> Result<(), Fallo> {
+    if orden.accion == Accion::Ayuda {
+        salida::mostrar_ayuda(&cfg.resolver_bd().0);
         return Ok(());
     }
 
-    if modo_fallback {
-        println!("{} resultado(s) parciales para \"{}\" (coincidencia con algún término):", filas.len(), termino);
-    } else {
-        println!("{} resultado(s) para \"{}\":", filas.len(), termino);
+    // Una base de datos indicada con -bd tiene que existir y ser válida.
+    if let Some(ruta) = &orden.bd {
+        db::validar(ruta).map_err(|e| Fallo::Uso(format!("la base de datos «{}» {e}", ruta.display())))?;
     }
 
-    for (id, contenido, creado_en) in &filas {
-        let mut tag_stmt = conn.prepare("
-            SELECT e.nombre FROM etiquetas e
-            JOIN texto_etiquetas te ON te.etiqueta_id = e.id
-            WHERE te.texto_id = ?1
-        ")?;
-        let tags: Vec<String> = tag_stmt
-            .query_map([id], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        println!("{}", "─".repeat(60));
-        println!("ID: {}  |  {}", id, creado_en);
-        if !tags.is_empty() {
-            println!("Etiquetas: {}", tags.join(", "));
-        }
-        println!();
-        skin.print_text(contenido);
+    if orden.accion == Accion::FijarBd {
+        return fijar_bd(orden.bd.as_deref().expect("FijarBd lleva ruta"), cfg);
     }
-    println!("{}", "─".repeat(60));
 
+    let bd = abrir_bd(orden.bd.as_deref(), cfg)?;
+    match orden.accion {
+        Accion::Anadir(inicial) => anadir(&bd, cfg, &inicial),
+        Accion::Buscar(args) => buscar(&bd, &args),
+        Accion::Editar(id) => editar(&bd, cfg, id),
+        Accion::Ayuda | Accion::FijarBd => unreachable!("tratadas antes"),
+    }
+}
+
+fn abrir_bd(parametro: Option<&Path>, cfg: &Config) -> Result<Bd, Fallo> {
+    if let Some(ruta) = parametro {
+        return Bd::abrir_existente(ruta).map_err(|e| Fallo::Error(format!("la base de datos «{}» {e}", ruta.display())));
+    }
+    let (ruta, aviso) = cfg.resolver_bd();
+    if let Some(aviso) = aviso {
+        eprintln!("Aviso: {aviso}");
+    }
+    let (bd, nueva) =
+        Bd::abrir_o_crear(&ruta).map_err(|e| Fallo::Error(format!("la base de datos «{}» {e}", ruta.display())))?;
+    if nueva {
+        eprintln!("Creada una base de datos vacía en «{}».", ruta.display());
+    }
+    Ok(bd)
+}
+
+/// `-bd FICHERO` sin más opciones: lo guarda en bdc.ini (ya validado).
+fn fijar_bd(ruta: &Path, cfg: &Config) -> Result<(), Fallo> {
+    let absoluta: PathBuf = std::path::absolute(ruta)?;
+    cfg.guardar_ruta_bd(&absoluta).map_err(|e| {
+        Fallo::Error(format!("no se puede escribir {}: {e}", cfg.ruta_ini().display()))
+    })?;
+    println!("Base de datos establecida: {}", absoluta.display());
+    println!("Guardada en {}", cfg.ruta_ini().display());
     Ok(())
 }
 
-fn mostrar_ayuda(db_path: &PathBuf) {
-    println!("BDC {} - Base de Conocimiento", VERSION);
-    println!();
-    println!("  Uso: BDC [opcion] [texto]");
-    println!();
-    println!("  -?, -h        Muestra esta ayuda");
-    println!("  -a [XXX]      Añadir el texto XXX al fichero de datos");
-    println!("  -b XXX        Busca el texto XXX en el fichero de datos");
-    println!("  -bd FICHERO   Usa FICHERO como base de datos");
-    println!();
-    println!("  También se acepta la notación clásica: /?, /a, /b, /bd");
-    println!();
-    println!("  Fichero de datos: {}", db_path.display());
+fn lanzar_editor(cfg: &Config, inicial: &str) -> Result<editor::Edicion, Fallo> {
+    let programa = editor::resolver_editor(cfg.editor.as_deref());
+    println!("Abriendo el editor ({programa}). Guarda y cierra el editor para continuar…");
+    let edicion = editor::editar(&programa, inicial).map_err(Fallo::Error)?;
+    if edicion.sin_cambios && edicion.inmediata {
+        eprintln!(
+            "Aviso: el editor se ha cerrado al momento sin cambios. Si es un editor gráfico, \
+             configúralo para que espere a que cierres el fichero (por ejemplo: editor=code --wait)."
+        );
+    }
+    Ok(edicion)
 }
 
-fn pedir_etiquetas() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut stdout = io::stdout();
-    print!("{}\r\n", "-".repeat(60));
-    print!("Introduce etiquetas. Enter = añadir etiqueta. Enter vacío = terminar.\r\n");
-    print!("{}\r\n", "-".repeat(60));
-    stdout.flush()?;
-
-    let mut tags: Vec<String> = Vec::new();
-
-    loop {
-        print!("> ");
-        stdout.flush()?;
-
-        match read_line(&mut stdout)? {
-            Some(tag) if !tag.is_empty() => tags.push(tag),
-            _ => break,
-        }
+fn anadir(bd: &Bd, cfg: &Config, inicial: &str) -> Result<(), Fallo> {
+    let edicion = lanzar_editor(cfg, inicial)?;
+    if edicion.texto.is_empty() {
+        println!("Texto vacío: no se guarda nada.");
+        return Ok(());
     }
+    let id = bd.anadir_nota(&edicion.texto)?;
+    println!("Nota {id} guardada.");
 
-    Ok(tags)
-}
-
-fn read_line(stdout: &mut io::Stdout) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut buf = String::new();
-
-    loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Esc) => return Ok(None),
-
-                (KeyModifiers::NONE, KeyCode::Enter) => {
-                    nueva_linea(stdout)?;
-                    return Ok(Some(buf));
-                }
-
-                (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        if let Ok(content) = clipboard.get_text() {
-                            let content = content.replace(['\r', '\n'], " ");
-                            print!("{}", content);
-                            stdout.flush()?;
-                            buf.push_str(&content);
-                        }
-                    }
-                }
-
-                (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                    print!("{c}");
-                    stdout.flush()?;
-                    buf.push(c);
-                }
-
-                (KeyModifiers::NONE, KeyCode::Backspace) => {
-                    if buf.pop().is_some() {
-                        print!("\x08 \x08");
-                        stdout.flush()?;
-                    }
-                }
-
-                _ => {}
-            }
-        }
-    }
-}
-
-fn modo_anadir(conn: &Connection, inicial: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = io::stdout();
-
-    println!("Escribe texto. Enter = nueva línea. Ctrl+V = pegar. ESC = aceptar.");
-    println!("{}", "-".repeat(60));
-
-    stdout.flush()?;
-
-    let mut text = inicial.to_string();
-    enable_raw_mode()?;
-    if !inicial.is_empty() {
-        escribir_raw(&mut stdout, inicial)?;
-    }
-
-    loop {
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match (key.modifiers, key.code) {
-                (KeyModifiers::NONE, KeyCode::Esc) => break,
-
-                (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        if let Ok(content) = clipboard.get_text() {
-                            let content = content.replace("\r\n", "\n");
-                            escribir_raw(&mut stdout, &content)?;
-                            text.push_str(&content);
-                        }
-                    }
-                }
-
-                (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                    print!("{c}");
-                    stdout.flush()?;
-                    text.push(c);
-                }
-
-                (KeyModifiers::NONE, KeyCode::Enter) => {
-                    nueva_linea(&mut stdout)?;
-                    text.push('\n');
-                }
-
-                (KeyModifiers::NONE, KeyCode::Backspace) => {
-                    match text.pop() {
-                        // Al borrar un salto de línea hay que subir y colocarse
-                        // al final de la línea anterior.
-                        Some('\n') => {
-                            let col = text.rsplit('\n').next().unwrap_or("").chars().count();
-                            execute!(stdout, MoveUp(1), MoveToColumn(col as u16))?;
-                        }
-                        Some(_) => {
-                            print!("\x08 \x08");
-                            stdout.flush()?;
-                        }
-                        None => {}
-                    }
-                }
-
-                _ => {}
-            }
-        }
-    }
-
-    let tags = pedir_etiquetas()?;
-    disable_raw_mode()?;
-
-    if !text.is_empty() {
-        guardar(conn, &text, &tags)?;
-        println!("Guardado correctamente.");
-    } else {
-        println!("Texto vacío, nada guardado.");
-    }
-
+    let etiquetas = salida::pedir_etiquetas(&[])?;
+    bd.fijar_etiquetas(id, &etiquetas)?;
+    println!("Etiquetas de la nota {id}: {}.", resumen(&bd.etiquetas(id)?));
     Ok(())
 }
 
-fn leer_ruta_ini() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let contenido = std::fs::read_to_string(exe_dir.join("bdc.ini")).ok()?;
+fn editar(bd: &Bd, cfg: &Config, id: i64) -> Result<(), Fallo> {
+    let nota = bd.nota(id)?.ok_or_else(|| Fallo::Error(format!("no existe ninguna nota con ID {id}.")))?;
 
-    let mut en_seccion = false;
-    for linea in contenido.lines() {
-        let linea = linea.trim();
-        if linea.is_empty() || linea.starts_with(';') {
-            continue;
-        }
-        if linea.starts_with('[') {
-            en_seccion = linea.eq_ignore_ascii_case("[base_de_datos]");
-            continue;
-        }
-        if en_seccion {
-            if let Some(pos) = linea.find('=') {
-                if linea[..pos].trim().eq_ignore_ascii_case("ruta") {
-                    let valor = linea[pos + 1..].trim();
-                    if !valor.is_empty() {
-                        return Some(PathBuf::from(valor));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn es_fichero_valido(path: &PathBuf) -> bool {
-    path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
-}
-
-fn resolver_ruta_db(bc_fichero: Option<&str>) -> PathBuf {
-    let defecto = || -> PathBuf {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("bdc.db")))
-            .unwrap_or_else(|| PathBuf::from("bdc.db"))
-    };
-
-    if let Some(ruta) = bc_fichero {
-        let path = PathBuf::from(ruta);
-        if es_fichero_valido(&path) {
-            return path;
-        }
-        if !path.exists() {
-            eprintln!("Aviso: el fichero '{}' no existe.", path.display());
+    let edicion = lanzar_editor(cfg, &nota.contenido)?;
+    if edicion.texto.is_empty() {
+        println!("La nota ha quedado vacía.");
+        if salida::confirmar(&format!("¿Borrar la nota {id}?"))? {
+            bd.borrar_nota(id)?;
+            println!("Nota {id} borrada.");
         } else {
-            eprintln!("Aviso: el fichero '{}' está vacío.", path.display());
+            println!("La nota {id} no se ha modificado.");
         }
-        eprintln!("Se buscará la configuración en bdc.ini.");
+        return Ok(());
+    }
+    if edicion.sin_cambios {
+        println!("El texto de la nota {id} no ha cambiado.");
+    } else {
+        bd.actualizar_nota(id, &edicion.texto)?;
+        println!("Nota {id} actualizada.");
     }
 
-    let ini_path = std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|d| d.join("bdc.ini")));
-    let ini_existe = ini_path.as_deref().map(|p| p.exists()).unwrap_or(false);
-
-    match leer_ruta_ini() {
-        Some(ruta_ini) if es_fichero_valido(&ruta_ini) => return ruta_ini,
-        Some(ruta_ini) => {
-            if !ruta_ini.exists() {
-                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini no existe.", ruta_ini.display());
-            } else {
-                eprintln!("Aviso: el fichero '{}' indicado en bdc.ini está vacío.", ruta_ini.display());
-            }
-            eprintln!("bdc.ini no resultó válido. Se usará el fichero por defecto.");
-        }
-        None if ini_existe => {
-            eprintln!("Aviso: bdc.ini no contiene una ruta válida. Se usará el fichero por defecto.");
-        }
-        None => {}
+    let etiquetas = salida::pedir_etiquetas(&nota.etiquetas)?;
+    if etiquetas != nota.etiquetas {
+        bd.fijar_etiquetas(id, &etiquetas)?;
+        println!("Etiquetas de la nota {id}: {}.", resumen(&bd.etiquetas(id)?));
     }
-
-    defecto()
-}
-
-/// Normaliza una opción de línea de comandos quitando el prefijo `/`, `--` o `-`
-/// y pasándola a minúsculas, para aceptar tanto la notación Windows (`/a`)
-/// como la Unix (`-a`, `--a`) indistintamente.
-fn normalizar_opcion(opcion: &str) -> String {
-    opcion
-        .strip_prefix("--")
-        .or_else(|| opcion.strip_prefix('/'))
-        .or_else(|| opcion.strip_prefix('-'))
-        .unwrap_or(opcion)
-        .to_lowercase()
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let all_args: Vec<String> = std::env::args().skip(1).collect();
-
-    let (db_path, args): (PathBuf, Vec<String>) =
-        if all_args.first().map(|s| normalizar_opcion(s)).as_deref() == Some("bd") {
-            let fichero = all_args.get(1).map(|s| s.as_str());
-            let db = resolver_ruta_db(fichero);
-            let resto = all_args.into_iter().skip(2).collect();
-            (db, resto)
-        } else {
-            (resolver_ruta_db(None), all_args)
-        };
-
-    let conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
-
-    match args.as_slice() {
-        [s] if matches!(normalizar_opcion(s).as_str(), "?" | "h" | "help") => {
-            mostrar_ayuda(&db_path);
-        }
-        [] => {
-            mostrar_ayuda(&db_path);
-        }
-        [opcion, resto @ ..] if normalizar_opcion(opcion) == "a" => {
-            let texto = resto.join(" ");
-            modo_anadir(&conn, &texto)?;
-        }
-        [opcion, resto @ ..] if normalizar_opcion(opcion) == "b" => {
-            let termino = resto.join(" ");
-            if termino.is_empty() {
-                eprintln!("Uso: BDC -b <texto>");
-            } else {
-                buscar(&conn, &termino)?;
-            }
-        }
-        otros => {
-            let termino = otros.join(" ");
-            buscar(&conn, &termino)?;
-        }
-    }
-
     Ok(())
+}
+
+fn buscar(bd: &Bd, args: &[String]) -> Result<(), Fallo> {
+    let terminos = texto::terminos_busqueda(args);
+    if terminos.is_empty() {
+        return Err(Fallo::Uso("falta el texto a buscar.".into()));
+    }
+    let buscado = args.join(" ");
+
+    // Primero las notas con todos los términos; si no hay, las que tengan alguno.
+    let mut notas = bd.buscar(&terminos, true)?;
+    let mut parcial = false;
+    if notas.is_empty() && terminos.len() > 1 {
+        notas = bd.buscar(&terminos, false)?;
+        parcial = true;
+    }
+
+    match (notas.len(), parcial) {
+        (0, _) => println!("No se ha encontrado nada con «{buscado}»."),
+        (n, false) => println!("{n} nota(s) con «{buscado}»:"),
+        (n, true) => println!("Ninguna nota contiene todos los términos; {n} nota(s) contienen alguno de «{buscado}»:"),
+    }
+    salida::mostrar_notas(&notas);
+    Ok(())
+}
+
+fn resumen(etiquetas: &[String]) -> String {
+    if etiquetas.is_empty() { "ninguna".into() } else { etiquetas.join(", ") }
 }
